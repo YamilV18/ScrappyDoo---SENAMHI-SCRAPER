@@ -75,10 +75,37 @@ class SenamhiMetadata:
             print(f"  [!] No se pudo extraer el JSON para {dp}")
             return []
 
-        estaciones = json.loads(match.group(1))
-        normalizadas = [
-            SenamhiMetadata._normalizar(e) for e in estaciones
-        ]
+        json_raw = match.group(1)
+
+        # Limpiar valores problemáticos antes de parsear
+        # 1. Reemplazar valores vacíos sin comillas → null
+        json_raw = re.sub(r':\s*,', ': null,', json_raw)
+        json_raw = re.sub(r':\s*}', ': null}', json_raw)
+        # 2. Eliminar comas finales antes de ] o } (JSON no las permite)
+        json_raw = re.sub(r',\s*([}\]])', r'\1', json_raw)
+        # 3. Reemplazar NaN e Infinity (válidos en JS pero no en JSON)
+        json_raw = re.sub(r':\s*NaN\b', ': null', json_raw)
+        json_raw = re.sub(r':\s*Infinity\b', ': null', json_raw)
+        json_raw = re.sub(r':\s*-Infinity\b', ': null', json_raw)
+        # 4. Eliminar caracteres de control invisibles
+        json_raw = re.sub(r'[\x00-\x1f\x7f]', '', json_raw)
+
+        try:
+            estaciones = json.loads(json_raw)
+        except json.JSONDecodeError as e:
+            # Mostrar contexto del error para diagnóstico
+            col   = e.colno
+            linea = e.lineno
+            # Extraer fragmento alrededor del error
+            chars  = json_raw.split('\n')
+            linea_problematica = chars[linea - 1] if linea <= len(chars) else ''
+            print(f"  [!] JSONDecodeError en {dp}: {e.msg} (línea {linea}, col {col})")
+            print(f"  [!] Fragmento: ...{linea_problematica[max(0,col-30):col+30]}...")
+
+            # Intento de rescate: parsear estación por estación
+            estaciones = SenamhiMetadata._parsear_estaciones_individual(json_raw, dp)
+
+        normalizadas = [SenamhiMetadata._normalizar(e) for e in estaciones]
         print(f"  {len(normalizadas)} estaciones encontradas")
         return normalizadas
 
@@ -104,3 +131,28 @@ class SenamhiMetadata:
             'longitud':   estacion['lon'],
             'estado':     estacion['estado'],
         }
+    
+    @staticmethod
+    def _parsear_estaciones_individual(json_raw, dp):
+        """
+        Fallback: extrae cada objeto JSON individualmente
+        cuando el array completo no es parseable.
+        """
+        print(f"  [!] Intentando rescate individual de estaciones...")
+        estaciones = []
+        # Buscar cada objeto {...} dentro del array
+        for i, obj_match in enumerate(re.finditer(r'\{[^{}]+\}', json_raw)):
+            obj_str = obj_match.group(0)
+            # Limpiar el objeto individual
+            obj_str = re.sub(r',\s*([}\]])', r'\1', obj_str)
+            obj_str = re.sub(r':\s*,', ': null,', obj_str)
+            obj_str = re.sub(r':\s*NaN\b', ': null', obj_str)
+            try:
+                estacion = json.loads(obj_str)
+                estaciones.append(estacion)
+            except json.JSONDecodeError as e:
+                print(f"  [!] Estación {i+1} omitida: {e.msg} → {obj_str[:80]}")
+                continue
+
+        print(f"  [RESCATE] {len(estaciones)} estaciones recuperadas de {dp}")
+        return estaciones
