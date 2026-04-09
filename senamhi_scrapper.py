@@ -10,7 +10,6 @@ from queue import Queue
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-MAX_REINTENTOS = 3
 class SenamhiScraper:
     """
     Scraper para descargar datos hidrometeorológicos de SENAMHI.
@@ -438,6 +437,28 @@ class SenamhiScraper:
         cola.join()
         hilo.join(timeout=5)
 
+    def _obtener_pendientes(self, estacion, opciones, carpeta):
+        """
+        Compara los meses disponibles contra los archivos ya descargados.
+        Retorna (pendientes, omitidos).
+        """
+        pendientes = []
+        omitidos   = []
+        for filtro_valor in opciones:
+            nombre = os.path.join(carpeta, f"{estacion['codigo']}_{filtro_valor}.csv")
+            if os.path.exists(nombre) and os.path.getsize(nombre) > 0:
+                omitidos.append(filtro_valor)
+            else:
+                pendientes.append(filtro_valor)
+        return pendientes, omitidos
+
+    def _construir_carpeta(self, estacion, carpeta_salida=None):
+        if carpeta_salida:
+            return carpeta_salida
+        tipo_estacion   = estacion['tipo'].upper()
+        nombre_estacion = f"{estacion['nombre'].upper()} - {estacion['codigo']}"
+        return os.path.join(self.carpeta_salida, tipo_estacion, nombre_estacion, 'data')
+
     # ══════════════════════════════════════════════════════════════════════
     # Exportar una estación
     # ══════════════════════════════════════════════════════════════════════
@@ -445,25 +466,32 @@ class SenamhiScraper:
     def exportar_estacion(self, estacion, carpeta_salida=None):
         
         sesion_temporal = self._browser is None
-        if sesion_temporal:
-            self.iniciar_sesion()
-
-        if carpeta_salida:
-            carpeta = carpeta_salida
-        else:
-            tipo_estacion = estacion['tipo'].upper()
-            nombre_estacion = f"{estacion['nombre'].upper()} - {estacion['codigo']}"            
-            # Construir ruta: csv_output/REGION/TIPO/NOMBRE/data
-            carpeta = os.path.join(
-                self.carpeta_salida, 
-                tipo_estacion, 
-                nombre_estacion, 
-                'data'
-            )
-            
+        carpeta     = self._construir_carpeta(estacion, carpeta_salida)
         url_grafico = self._url_grafico(estacion)
-        cola, hilo = self._iniciar_worker()
 
+        os.makedirs(carpeta, exist_ok=True)
+
+        # ── PASO 1: Verificación rápida sin abrir el navegador ─────────────────
+        # Obtener lista de meses disponibles via requests (sin Playwright)
+        print(f"\n[PRE] Verificando meses ya descargados para {estacion['nombre']}...")
+        opciones_previas = self._obtener_opciones_sin_navegador(estacion)
+
+        if opciones_previas:
+            pendientes, omitidos = self._obtener_pendientes(estacion, opciones_previas, carpeta)
+            print(f"  Meses conocidos    : {len(opciones_previas)}")
+            print(f"  Ya descargados     : {len(omitidos)}")
+            print(f"  Pendientes         : {len(pendientes)}")
+
+            if not pendientes:
+                print("  [OK] Estación completamente descargada, omitiendo navegador.")
+                return
+        else:
+            # No se pudo obtener opciones sin navegador, continuar normalmente
+            pendientes = None
+            omitidos   = []
+
+        # ── PASO 2: Abrir navegador solo si hay pendientes ─────────────────────
+        cola, hilo = self._iniciar_worker()
         try:
             context = self._browser.contexts[0]
             page    = context.new_page()
@@ -489,8 +517,27 @@ class SenamhiScraper:
                 raise Exception("ComboBox no encontrado")
 
             opciones = [o.get('value') for o in select.find_all('option')]
-            print(f"[5] Meses disponibles: {len(opciones)}")
-            os.makedirs(carpeta, exist_ok=True)
+
+            # Re-verificar con opciones actualizadas del navegador
+            pendientes, omitidos = self._obtener_pendientes(estacion, opciones, carpeta)
+
+            # Detectar meses nuevos respecto a la verificación previa
+            if opciones_previas:
+                nuevos = [m for m in opciones if m not in opciones_previas]
+                if nuevos:
+                    print(f"  [+] Meses nuevos detectados: {nuevos}")
+
+            print(f"[5] Meses disponibles  : {len(opciones)}")
+            print(f"    Ya descargados     : {len(omitidos)}")
+            print(f"    Pendientes         : {len(pendientes)}")
+
+
+            if not pendientes:
+                print("    [OK] Estación completamente descargada, omitiendo.")
+                page.close()
+                self._cerrar_worker(cola, hilo)
+                return
+
 
             errores = []
             tiempos = []
@@ -501,11 +548,13 @@ class SenamhiScraper:
                 'error_servidor': [],
                 'error_scraper':  [],
             }
+            MAX_REINTENTOS = 3
 
-            for i, filtro_valor in enumerate(opciones):
+            for i, filtro_valor in enumerate(pendientes):
                 if self._interrumpido:
+                    print("\n[!] Interrumpido")
                     break
-                print(f"\n--- [{i+1}/{len(opciones)}] {filtro_valor} ---")
+                print(f"\n--- [{i+1}/{len(pendientes)}] {filtro_valor} ---")
                 t0 = time.time()
                 exito = False
                 for intento in range(MAX_REINTENTOS):
@@ -518,6 +567,8 @@ class SenamhiScraper:
                             self._esperar_token(page)
 
                         frame = self._select_y_esperar_iframe(page, filtro_valor)
+                        if frame is None:
+                            continue
 
                         # Validar contenido antes de extraer
                         estado, msg = self._validar_contenido_iframe(frame, filtro_valor, estacion)
@@ -637,6 +688,31 @@ class SenamhiScraper:
             # Solo cerrar Edge si fue sesión temporal
             if sesion_temporal:
                 self.cerrar_sesion()
+
+    def _obtener_opciones_sin_navegador(self, estacion):
+        """
+        Obtiene la lista de meses disponibles via requests+BeautifulSoup,
+        sin necesidad de abrir el navegador.
+        Retorna lista de valores del ComboBox o [] si falla.
+        """
+        try:
+            url = (
+                f"https://www.senamhi.gob.pe/mapas/mapa-estaciones-2/map_red_graf.php"
+                f"?cod={estacion['codigo']}"
+                f"&estado={estacion['estado']}"
+                f"&tipo_esta={estacion['ico']}"
+                f"&cate={estacion['categoria']}"
+                f"&cod_old={estacion.get('codigo_old') or ''}"
+            )
+            response = requests.get(url, timeout=10)
+            soup     = BeautifulSoup(response.text, 'html.parser')
+            select   = soup.find('select', {'name': 'CBOFiltro'})
+            if not select:
+                return []
+            return [o.get('value') for o in select.find_all('option')]
+        except Exception as e:
+            print(f"  [!] No se pudo obtener opciones sin navegador: {e}")
+            return []
 
     # ══════════════════════════════════════════════════════════════════════
     # Exportar múltiples estaciones
